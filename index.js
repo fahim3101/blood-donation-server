@@ -27,7 +27,7 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
-    await client.connect(); // ← ADD THIS LINE
+    
 
     const db = client.db('bloodDonationDB');
     const usersCollection = db.collection('users');
