@@ -28,7 +28,6 @@ const client = new MongoClient(uri, {
 async function run() {
   try {
     
-
     const db = client.db('bloodDonationDB');
     const usersCollection = db.collection('users');
     const donationRequestsCollection = db.collection('donationRequests');
@@ -372,8 +371,13 @@ async function run() {
       const result = await donationRequestsCollection
         .aggregate([
           {
+            $addFields: {
+              createdAtDate: { $toDate: '$createdAt' }
+            }
+          },
+          {
             $group: {
-              _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+              _id: { $dateToString: { format: '%Y-%m-%d', date: '$createdAtDate' } },
               count: { $sum: 1 },
             },
           },
