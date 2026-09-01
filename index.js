@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const { MongoClient, ServerApiVersion, ObjectId } = require('mongodb');
 require('dotenv').config();
 
@@ -22,8 +24,14 @@ const port = process.env.PORT || 5000;
 const stripe = process.env.STRIPE_SECRET_KEY ? require('stripe')(process.env.STRIPE_SECRET_KEY) : null;
 
 // ------------------ Middleware ------------------
+app.use(helmet());
 app.use(cors());
 app.use(express.json());
+
+// Rate limit: 100 req / 15 min per IP (global), stricter for auth
+const globalLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 200, standardHeaders: true, legacyHeaders: false });
+const authLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 10, message: { message: 'Too many attempts, try again later' }, standardHeaders: true, legacyHeaders: false });
+app.use(globalLimiter);
 
 // ------------------ MongoDB Setup ------------------
 const uri = process.env.DB_URI || `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@${process.env.DB_CLUSTER}/?retryWrites=true&w=majority`;
@@ -42,6 +50,17 @@ async function run() {
 
     // Auto-expire password reset tokens 15 minutes after creation (non-blocking)
     passwordResetCollection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {});
+
+    // Helper: auto-cancel expired pending requests (donationDate < today)
+    const autoCancelExpired = async () => {
+      const today = new Date().toISOString().split('T')[0];
+      try {
+        await donationRequestsCollection.updateMany(
+          { donationStatus: 'pending', donationDate: { $lt: today } },
+          { $set: { donationStatus: 'canceled' } }
+        );
+      } catch {}
+    };
     // ... rest of the code
 
     // ------------------ Role check middlewares (need usersCollection, so defined inside run) ------------------
@@ -66,7 +85,7 @@ async function run() {
     // ================= AUTH & USERS =================
 
     // Register a new user
-    app.post('/users', async (req, res) => {
+    app.post('/users', authLimiter, async (req, res) => {
       const { name, email, password, avatar, bloodGroup, district, upazila } = req.body;
 
       const existing = await usersCollection.findOne({ email });
@@ -86,6 +105,7 @@ async function run() {
         upazila,
         role: 'donor',
         status: 'active',
+        isAvailable: true,
         createdAt: new Date(),
       };
 
@@ -94,7 +114,7 @@ async function run() {
     });
 
     // Login - issue JWT
-    app.post('/jwt', async (req, res) => {
+    app.post('/jwt', authLimiter, async (req, res) => {
       const { email, password } = req.body;
       const user = await usersCollection.findOne({ email });
 
@@ -138,11 +158,20 @@ async function run() {
       if (email !== req.decoded.email) {
         return res.status(403).send({ message: 'forbidden access' });
       }
-      const { name, avatar, bloodGroup, district, upazila } = req.body;
-      const result = await usersCollection.updateOne(
-        { email },
-        { $set: { name, avatar, bloodGroup, district, upazila } }
-      );
+      const { name, avatar, bloodGroup, district, upazila, isAvailable } = req.body;
+      const update = { name, avatar, bloodGroup, district, upazila };
+      if (typeof isAvailable === 'boolean') update.isAvailable = isAvailable;
+      const result = await usersCollection.updateOne({ email }, { $set: update });
+      res.send(result);
+    });
+
+    // Toggle availability (quick)
+    app.patch('/users/availability/:email', verifyToken, async (req, res) => {
+      const email = req.params.email;
+      if (email !== req.decoded.email) return res.status(403).send({ message: 'forbidden access' });
+      const { isAvailable } = req.body;
+      if (typeof isAvailable !== 'boolean') return res.status(400).send({ message: 'isAvailable must be boolean' });
+      const result = await usersCollection.updateOne({ email }, { $set: { isAvailable } });
       res.send(result);
     });
 
@@ -189,8 +218,9 @@ async function run() {
 
     // ================= SEARCH DONORS (protected - prevents public email scraping) =================
     app.get('/search-donors', verifyToken, async (req, res) => {
-      const { bloodGroup, district, upazila } = req.query;
-      const query = { role: { $in: ['donor', 'volunteer'] }, status: 'active' };
+      const { bloodGroup, district, upazila, availableOnly } = req.query;
+      const query = { role: { $in: ['donor', 'volunteer'] }, status: 'active', isAvailable: { $ne: false } };
+      if (availableOnly === 'false') delete query.isAvailable;
       if (bloodGroup) query.bloodGroup = bloodGroup;
       if (district) query.district = district;
       if (upazila) query.upazila = upazila;
@@ -212,7 +242,7 @@ async function run() {
     // ================= PASSWORD RESET =================
 
     // Step 1: user requests a reset link via email
-    app.post('/forgot-password', async (req, res) => {
+    app.post('/forgot-password', authLimiter, async (req, res) => {
       const { email } = req.body;
       if (!email) return res.status(400).send({ message: 'Email is required' });
 
@@ -246,7 +276,7 @@ async function run() {
     });
 
     // Step 2: user submits new password using token from email
-    app.post('/reset-password', async (req, res) => {
+    app.post('/reset-password', authLimiter, async (req, res) => {
       const { email, token, newPassword } = req.body;
       if (!email || !token || !newPassword) {
         return res.status(400).send({ message: 'Missing required fields' });
@@ -334,6 +364,7 @@ async function run() {
 
     // Public: pending donation requests list (paginated)
     app.get('/donation-requests/pending', async (req, res) => {
+      await autoCancelExpired();
       const page = parseInt(req.query.page) || 0;
       const limit = parseInt(req.query.limit) || 12;
       const query = { donationStatus: 'pending' };
@@ -349,6 +380,7 @@ async function run() {
 
     // Logged-in donor's own recent 3 requests
     app.get('/donation-requests/recent', verifyToken, async (req, res) => {
+      await autoCancelExpired();
       const email = req.decoded.email;
       const requests = await donationRequestsCollection
         .find({ requesterEmail: email })
@@ -360,6 +392,7 @@ async function run() {
 
     // Logged-in donor's own requests (paginated + filter)
     app.get('/donation-requests/mine', verifyToken, async (req, res) => {
+      await autoCancelExpired();
       const email = req.decoded.email;
       const page = parseInt(req.query.page) || 0;
       const limit = parseInt(req.query.limit) || 10;
@@ -380,6 +413,7 @@ async function run() {
 
     // Admin / Volunteer: all requests (paginated + filter)
     app.get('/donation-requests/all', verifyToken, verifyAdminOrVolunteer, async (req, res) => {
+      await autoCancelExpired();
       const page = parseInt(req.query.page) || 0;
       const limit = parseInt(req.query.limit) || 10;
       const status = req.query.status;
@@ -510,6 +544,13 @@ async function run() {
       const totalFunding = fundingAgg[0]?.total || 0;
 
       res.send({ totalUsers, totalRequests, totalFunding });
+    });
+
+    // Public stats for Home page (no auth)
+    app.get('/public-stats', async (req, res) => {
+      const totalUsers = await usersCollection.countDocuments({ role: { $in: ['donor', 'volunteer'] }, status: 'active' });
+      const totalRequests = await donationRequestsCollection.countDocuments();
+      res.send({ totalUsers, totalRequests, districts: 64 });
     });
 
     // Chart data: donation requests grouped by date (last 7 days)
