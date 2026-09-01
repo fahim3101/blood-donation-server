@@ -7,6 +7,13 @@ require('dotenv').config();
 
 const verifyToken = require('./middleware/verifyToken');
 const { districts, upazilas } = require('./data/geoData');
+const { generateResetToken, hashToken } = require('./utils/tokens');
+const {
+  sendEmail,
+  passwordResetTemplate,
+  newDonationRequestTemplate,
+  donationStatusTemplate,
+} = require('./utils/emailService');
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -32,6 +39,10 @@ async function run() {
     const usersCollection = db.collection('users');
     const donationRequestsCollection = db.collection('donationRequests');
     const fundingCollection = db.collection('fundings');
+    const passwordResetCollection = db.collection('passwordResets');
+
+    // Auto-expire password reset tokens 15 minutes after creation
+    await passwordResetCollection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
     // ... rest of the code
 
     // ------------------ Role check middlewares (need usersCollection, so defined inside run) ------------------
@@ -196,6 +207,65 @@ async function run() {
       res.send(upazilas[district] || []);
     });
 
+    // ================= PASSWORD RESET =================
+
+    // Step 1: user requests a reset link via email
+    app.post('/forgot-password', async (req, res) => {
+      const { email } = req.body;
+      if (!email) return res.status(400).send({ message: 'Email is required' });
+
+      // Always respond 200 to avoid leaking which emails exist
+      const user = await usersCollection.findOne({ email });
+      if (!user) return res.send({ message: 'If that email exists, a reset link has been sent.' });
+
+      const rawToken = generateResetToken();
+      const tokenHash = hashToken(rawToken);
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000); // 15 minutes
+
+      // Remove any previous tokens for this user
+      await passwordResetCollection.deleteMany({ email });
+      await passwordResetCollection.insertOne({ email, tokenHash, expiresAt, createdAt: new Date() });
+
+      const clientBase = process.env.CLIENT_URL || 'http://localhost:5173';
+      const resetLink = `${clientBase}/reset-password?token=${rawToken}&email=${encodeURIComponent(email)}`;
+
+      const sent = await sendEmail({
+        to: email,
+        subject: 'Reset your Lifeline password',
+        html: passwordResetTemplate(user.name, resetLink),
+      });
+
+      // Always log to server console (visible in local dev + Vercel logs)
+      if (!sent) {
+        console.log(`[password-reset] Email not configured. Link for ${email}: ${resetLink}`);
+      }
+
+      res.send({ message: 'If that email exists, a reset link has been sent.' });
+    });
+
+    // Step 2: user submits new password using token from email
+    app.post('/reset-password', async (req, res) => {
+      const { email, token, newPassword } = req.body;
+      if (!email || !token || !newPassword) {
+        return res.status(400).send({ message: 'Missing required fields' });
+      }
+      if (newPassword.length < 6) {
+        return res.status(400).send({ message: 'Password must be at least 6 characters' });
+      }
+
+      const tokenHash = hashToken(token);
+      const record = await passwordResetCollection.findOne({ email, tokenHash });
+      if (!record) {
+        return res.status(400).send({ message: 'Invalid or expired reset link' });
+      }
+
+      const hashedPassword = await bcrypt.hash(newPassword, 10);
+      await usersCollection.updateOne({ email }, { $set: { password: hashedPassword } });
+      await passwordResetCollection.deleteOne({ email, tokenHash });
+
+      res.send({ message: 'Password reset successful. You can now log in.' });
+    });
+
     // ================= DONATION REQUESTS =================
 
     // Create a donation request
@@ -215,6 +285,40 @@ async function run() {
       };
 
       const result = await donationRequestsCollection.insertOne(donationRequest);
+
+      // Fire-and-forget email to matching donors (don't block the response)
+      try {
+        if (donationRequest.bloodGroup) {
+          const matchingDonors = await usersCollection
+            .find(
+              {
+                bloodGroup: donationRequest.bloodGroup,
+                role: { $in: ['donor', 'volunteer'] },
+                status: 'active',
+                email: { $ne: requesterEmail },
+              },
+              { projection: { name: 1, email: 1 } }
+            )
+            .limit(25) // cap to avoid spamming
+            .toArray();
+
+          const clientBase = process.env.CLIENT_URL || 'http://localhost:5173';
+          const link = `${clientBase}/donation-requests/${result.insertedId}`;
+
+          Promise.all(
+            matchingDonors.map((d) =>
+              sendEmail({
+                to: d.email,
+                subject: `Urgent ${donationRequest.bloodGroup} blood needed`,
+                html: newDonationRequestTemplate(d.name, donationRequest, link),
+              })
+            )
+          ).catch((err) => console.error('[email] bulk notify failed:', err.message));
+        }
+      } catch (err) {
+        console.error('[email] notify lookup failed:', err.message);
+      }
+
       res.send(result);
     });
 
@@ -333,6 +437,25 @@ async function run() {
       }
 
       const result = await donationRequestsCollection.updateOne({ _id: new ObjectId(id) }, { $set: updateDoc });
+
+      // Notify the requester when status changes (except when they themselves changed it)
+      try {
+        if (existing.requesterEmail !== req.decoded.email) {
+          const requester = await usersCollection.findOne({ email: existing.requesterEmail });
+          if (requester) {
+            const clientBase = process.env.CLIENT_URL || 'http://localhost:5173';
+            const link = `${clientBase}/dashboard/my-donation-requests`;
+            sendEmail({
+              to: requester.email,
+              subject: `Your donation request is now ${status}`,
+              html: donationStatusTemplate(requester.name, status, link),
+            }).catch((err) => console.error('[email] status notify failed:', err.message));
+          }
+        }
+      } catch (err) {
+        console.error('[email] status notify lookup failed:', err.message);
+      }
+
       res.send(result);
     });
 
