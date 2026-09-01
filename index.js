@@ -22,26 +22,8 @@ const port = process.env.PORT || 5000;
 const stripe = process.env.STRIPE_SECRET_KEY ? require('stripe')(process.env.STRIPE_SECRET_KEY) : null;
 
 // ------------------ Middleware ------------------
-const allowedOrigins = [
-  'http://localhost:5173',
-  'http://localhost:3000',
-  process.env.CLIENT_URL,
-].filter(Boolean);
-
-app.use(cors({
-  origin: (origin, cb) => {
-    // allow server-to-server / curl / mobile with no origin
-    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
-    cb(null, true); // still allow but log — tighten to `cb(new Error('Not allowed by CORS'))` for strict
-  },
-  credentials: true,
-}));
+app.use(cors());
 app.use(express.json());
-
-// Fail fast if critical env is missing
-if (!process.env.JWT_ACCESS_SECRET) {
-  console.error('❌ FATAL: JWT_ACCESS_SECRET is not set in .env');
-}
 
 // ------------------ MongoDB Setup ------------------
 const uri = process.env.DB_URI || `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@${process.env.DB_CLUSTER}/?retryWrites=true&w=majority`;
@@ -52,16 +34,14 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
-    // Ensure DB is connected before handling any request
-    await client.connect();
     const db = client.db('bloodDonationDB');
     const usersCollection = db.collection('users');
     const donationRequestsCollection = db.collection('donationRequests');
     const fundingCollection = db.collection('fundings');
     const passwordResetCollection = db.collection('passwordResets');
 
-    // Auto-expire password reset tokens 15 minutes after creation
-    await passwordResetCollection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+    // Auto-expire password reset tokens 15 minutes after creation (non-blocking)
+    passwordResetCollection.createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }).catch(() => {});
     // ... rest of the code
 
     // ------------------ Role check middlewares (need usersCollection, so defined inside run) ------------------
