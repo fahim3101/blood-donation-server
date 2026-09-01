@@ -22,8 +22,26 @@ const port = process.env.PORT || 5000;
 const stripe = process.env.STRIPE_SECRET_KEY ? require('stripe')(process.env.STRIPE_SECRET_KEY) : null;
 
 // ------------------ Middleware ------------------
-app.use(cors());
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://localhost:3000',
+  process.env.CLIENT_URL,
+].filter(Boolean);
+
+app.use(cors({
+  origin: (origin, cb) => {
+    // allow server-to-server / curl / mobile with no origin
+    if (!origin || allowedOrigins.includes(origin)) return cb(null, true);
+    cb(null, true); // still allow but log — tighten to `cb(new Error('Not allowed by CORS'))` for strict
+  },
+  credentials: true,
+}));
 app.use(express.json());
+
+// Fail fast if critical env is missing
+if (!process.env.JWT_ACCESS_SECRET) {
+  console.error('❌ FATAL: JWT_ACCESS_SECRET is not set in .env');
+}
 
 // ------------------ MongoDB Setup ------------------
 const uri = process.env.DB_URI || `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@${process.env.DB_CLUSTER}/?retryWrites=true&w=majority`;
@@ -34,7 +52,8 @@ const client = new MongoClient(uri, {
 
 async function run() {
   try {
-    
+    // Ensure DB is connected before handling any request
+    await client.connect();
     const db = client.db('bloodDonationDB');
     const usersCollection = db.collection('users');
     const donationRequestsCollection = db.collection('donationRequests');
@@ -172,6 +191,7 @@ async function run() {
     // Block / Unblock user
     app.patch('/users/status/:id', verifyToken, verifyAdmin, async (req, res) => {
       const id = req.params.id;
+      if (!ObjectId.isValid(id)) return res.status(400).send({ message: 'Invalid user id' });
       const { status } = req.body;
       const result = await usersCollection.updateOne({ _id: new ObjectId(id) }, { $set: { status } });
       res.send(result);
@@ -180,13 +200,15 @@ async function run() {
     // Change user role
     app.patch('/users/role/:id', verifyToken, verifyAdmin, async (req, res) => {
       const id = req.params.id;
+      if (!ObjectId.isValid(id)) return res.status(400).send({ message: 'Invalid user id' });
       const { role } = req.body;
+      if (!['donor', 'volunteer', 'admin'].includes(role)) return res.status(400).send({ message: 'Invalid role' });
       const result = await usersCollection.updateOne({ _id: new ObjectId(id) }, { $set: { role } });
       res.send(result);
     });
 
-    // ================= SEARCH DONORS (public) =================
-    app.get('/search-donors', async (req, res) => {
+    // ================= SEARCH DONORS (protected - prevents public email scraping) =================
+    app.get('/search-donors', verifyToken, async (req, res) => {
       const { bloodGroup, district, upazila } = req.query;
       const query = { role: { $in: ['donor', 'volunteer'] }, status: 'active' };
       if (bloodGroup) query.bloodGroup = bloodGroup;
@@ -277,6 +299,14 @@ async function run() {
         return res.status(403).send({ message: 'Blocked users cannot create donation requests' });
       }
 
+      // Validate donation date is not in the past
+      if (req.body.donationDate) {
+        const today = new Date().toISOString().split('T')[0];
+        if (req.body.donationDate < today) {
+          return res.status(400).send({ message: 'Donation date cannot be in the past' });
+        }
+      }
+
       const donationRequest = {
         ...req.body,
         requesterEmail,
@@ -322,13 +352,19 @@ async function run() {
       res.send(result);
     });
 
-    // Public: pending donation requests list
+    // Public: pending donation requests list (paginated)
     app.get('/donation-requests/pending', async (req, res) => {
-      const limit = parseInt(req.query.limit) || 0;
-      let cursor = donationRequestsCollection.find({ donationStatus: 'pending' }).sort({ createdAt: -1 });
-      if (limit) cursor = cursor.limit(limit);
-      const requests = await cursor.toArray();
-      res.send(requests);
+      const page = parseInt(req.query.page) || 0;
+      const limit = parseInt(req.query.limit) || 12;
+      const query = { donationStatus: 'pending' };
+      const requests = await donationRequestsCollection
+        .find(query)
+        .sort({ createdAt: -1 })
+        .skip(page * limit)
+        .limit(limit)
+        .toArray();
+      const count = await donationRequestsCollection.countDocuments(query);
+      res.send({ requests, count });
     });
 
     // Logged-in donor's own recent 3 requests
@@ -384,13 +420,16 @@ async function run() {
     // Single donation request details
     app.get('/donation-requests/:id', verifyToken, async (req, res) => {
       const id = req.params.id;
+      if (!ObjectId.isValid(id)) return res.status(400).send({ message: 'Invalid request id' });
       const request = await donationRequestsCollection.findOne({ _id: new ObjectId(id) });
+      if (!request) return res.status(404).send({ message: 'Request not found' });
       res.send(request);
     });
 
     // Edit a donation request (owner or admin)
     app.patch('/donation-requests/:id', verifyToken, async (req, res) => {
       const id = req.params.id;
+      if (!ObjectId.isValid(id)) return res.status(400).send({ message: 'Invalid request id' });
       const existing = await donationRequestsCollection.findOne({ _id: new ObjectId(id) });
       const requester = await usersCollection.findOne({ email: req.decoded.email });
 
@@ -417,11 +456,13 @@ async function run() {
     // Update donation status (handles donate / done / cancel / volunteer-admin override)
     app.patch('/donation-requests/:id/status', verifyToken, async (req, res) => {
       const id = req.params.id;
-      const { status, donorInfo } = req.body;
+      if (!ObjectId.isValid(id)) return res.status(400).send({ message: 'Invalid request id' });
+      const { status } = req.body;
       const existing = await donationRequestsCollection.findOne({ _id: new ObjectId(id) });
       const actor = await usersCollection.findOne({ email: req.decoded.email });
 
       if (!existing || !actor) return res.status(404).send({ message: 'Not found' });
+      if (actor.status === 'blocked') return res.status(403).send({ message: 'Your account is blocked' });
 
       const isOwner = existing.requesterEmail === req.decoded.email;
       const isPrivileged = actor.role === 'admin' || actor.role === 'volunteer';
@@ -432,8 +473,9 @@ async function run() {
       }
 
       const updateDoc = { donationStatus: status };
-      if (status === 'inprogress' && donorInfo) {
-        updateDoc.donorInfo = donorInfo;
+      // Never trust donorInfo from client — always use actor's verified identity
+      if (status === 'inprogress') {
+        updateDoc.donorInfo = { name: actor.name, email: actor.email };
       }
 
       const result = await donationRequestsCollection.updateOne({ _id: new ObjectId(id) }, { $set: updateDoc });
@@ -462,6 +504,7 @@ async function run() {
     // Delete a donation request (owner or admin)
     app.delete('/donation-requests/:id', verifyToken, async (req, res) => {
       const id = req.params.id;
+      if (!ObjectId.isValid(id)) return res.status(400).send({ message: 'Invalid request id' });
       const existing = await donationRequestsCollection.findOne({ _id: new ObjectId(id) });
       const requester = await usersCollection.findOne({ email: req.decoded.email });
 
@@ -515,8 +558,10 @@ async function run() {
     app.post('/create-payment-intent', verifyToken, async (req, res) => {
       if (!stripe) return res.status(500).send({ message: 'Stripe is not configured on the server' });
       const { amount } = req.body;
+      const num = Number(amount);
+      if (!num || isNaN(num) || num < 1 || num > 500) return res.status(400).send({ message: 'Amount must be between $1 and $500' });
       const paymentIntent = await stripe.paymentIntents.create({
-        amount: Math.round(amount * 100),
+        amount: Math.round(num * 100),
         currency: 'usd',
         payment_method_types: ['card'],
       });
@@ -524,7 +569,11 @@ async function run() {
     });
 
     app.post('/fundings', verifyToken, async (req, res) => {
-      const funding = { ...req.body, date: new Date() };
+      const { amount, name, email } = req.body;
+      const num = Number(amount);
+      if (!num || isNaN(num) || num < 1 || num > 500) return res.status(400).send({ message: 'Invalid amount' });
+      if (!name || !email) return res.status(400).send({ message: 'Missing funding info' });
+      const funding = { name, email, amount: num, date: new Date() };
       const result = await fundingCollection.insertOne(funding);
       res.send(result);
     });

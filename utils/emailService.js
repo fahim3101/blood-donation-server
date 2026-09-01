@@ -59,13 +59,13 @@ const newDonationRequestTemplate = (donorName, requestDetails, link) => `
     <div style="background: #ffffff; border-radius: 16px; padding: 32px; border: 1px solid #eee;">
       <h2 style="color: #c0392b; margin-top: 0;">🩸 Urgent Blood Donation Request</h2>
       <p>Hi <strong>${donorName}</strong>,</p>
-      <p>A new donation request matching your blood group was just created:</p>
+      <p>A new donation request matching your blood group <strong>${requestDetails.bloodGroup || ''}</strong> was just created:</p>
       <ul>
-        <li><strong>Patient:</strong> ${requestDetails.patientName}</li>
-        <li><strong>Blood Group:</strong> ${requestDetails.bloodGroup}</li>
-        <li><strong>Hospital:</strong> ${requestDetails.hospitalName}</li>
-        <li><strong>Location:</strong> ${requestDetails.district}, ${requestDetails.upazila}</li>
-        <li><strong>Date:</strong> ${requestDetails.donationDate}</li>
+        <li><strong>Patient:</strong> ${requestDetails.recipientName || 'A patient'}</li>
+        <li><strong>Blood Group:</strong> ${requestDetails.bloodGroup || 'N/A'}</li>
+        <li><strong>Hospital:</strong> ${requestDetails.hospitalName || 'N/A'}</li>
+        <li><strong>Location:</strong> ${[requestDetails.recipientDistrict, requestDetails.recipientUpazila].filter(Boolean).join(', ') || 'N/A'}${requestDetails.fullAddress ? ' - ' + requestDetails.fullAddress : ''}</li>
+        <li><strong>Date:</strong> ${requestDetails.donationDate || 'N/A'} at ${requestDetails.donationTime || ''}</li>
       </ul>
       <p style="text-align: center; margin: 24px 0;">
         <a href="${link}" style="background: #c0392b; color: #ffffff; padding: 12px 24px; border-radius: 8px; text-decoration: none; font-weight: 600;">
